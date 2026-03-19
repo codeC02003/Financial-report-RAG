@@ -1,0 +1,32 @@
+# Multimodal Document QA Configuration
+
+pdf_processing:
+  dpi: 120
+  max_pages: 150
+  chunk_size: 200
+  chunk_overlap: 40
+  extract_tables: true
+  ocr_fallback: true
+
+model:
+  vision_model: "Qwen/Qwen2-VL-2B-Instruct"
+  embedding_model: "sentence-transformers/all-MiniLM-L6-v2"
+  device: "cpu"  # CPU avoids MPS OOM; slower but stable
+  max_new_tokens: 256
+  temperature: 0.1
+
+retrieval:
+  top_k: 8
+  similarity_threshold: 0.1
+  index_type: "flat"
+
+qa_engine:
+  confidence_threshold: 0.4
+  enable_hallucination_detection: true
+  max_context_pages: 10
+  unanswerable_label: "UNANSWERABLE"
+
+api:
+  host: "0.0.0.0"
+  port: 8000
+  max_file_size_mb: 50

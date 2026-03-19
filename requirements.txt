@@ -1,0 +1,39 @@
+# PDF Processing
+PyMuPDF>=1.24.0
+pdfplumber>=0.11.0
+pdf2image>=1.17.0
+Pillow>=10.0.0
+
+# OCR
+pytesseract>=0.3.10
+
+# Vision-Language Model
+transformers>=4.45.0
+torch>=2.2.0
+accelerate>=0.30.0
+qwen-vl-utils>=0.0.8
+
+# Embeddings & Retrieval
+sentence-transformers>=3.0.0
+faiss-cpu>=1.8.0
+
+# Table Extraction
+camelot-py[base]>=0.11.0
+tabula-py>=2.9.0
+
+# API & Web
+fastapi>=0.115.0
+uvicorn>=0.30.0
+streamlit>=1.38.0
+python-multipart>=0.0.9
+
+# Evaluation
+rouge-score>=0.1.2
+nltk>=3.9.0
+
+# Utilities
+numpy>=1.26.0
+pandas>=2.2.0
+tqdm>=4.66.0
+pydantic>=2.9.0
+python-dotenv>=1.0.0
