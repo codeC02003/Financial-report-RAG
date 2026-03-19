@@ -57,6 +57,11 @@ app.add_middleware(
 )
 
 
+@app.get("/")
+def root():
+    return {"status": "ok", "service": "FinRAG API"}
+
+
 class ChatMessage(BaseModel):
     role: str  # "user" or "assistant"
     content: str
