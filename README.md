@@ -1,3 +1,12 @@
+---
+title: FinRAG API
+emoji: ⚡
+colorFrom: blue
+colorTo: cyan
+sdk: docker
+app_port: 7860
+---
+
 # FinRAG — Multimodal Document QA
 
 An intelligent document question-answering system that combines **vision-language models**, **hybrid retrieval (BM25 + semantic search)**, and **dynamic table extraction** to answer questions about uploaded PDF documents with high accuracy.
