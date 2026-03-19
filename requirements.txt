@@ -10,6 +10,7 @@ pytesseract>=0.3.10
 # Vision-Language Model
 transformers>=4.45.0
 torch>=2.2.0
+torchvision>=0.17.0
 accelerate>=0.30.0
 qwen-vl-utils>=0.0.8
 
