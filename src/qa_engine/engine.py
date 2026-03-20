@@ -1043,6 +1043,29 @@ class DocumentQAEngine:
                 if first_pages_text:
                     conv_context = first_pages_text + "\n\n" + context_text
 
+            # For "who is" questions (CEO, officers, auditor, etc.), scan all chunks
+            # for relevant keywords since retrieval may miss signature/officer pages
+            is_who_q = bool(re.search(r'who (is|are|was)', q_lower))
+            if is_who_q:
+                who_keywords = []
+                for kw in ["ceo", "chief executive", "president", "chairman",
+                           "chief financial", "cfo", "officer", "director",
+                           "auditor", "secretary", "board"]:
+                    if kw in q_lower:
+                        who_keywords.append(kw)
+                if not who_keywords:
+                    # Generic "who is" — search broadly
+                    who_keywords = ["chief executive", "president", "officer",
+                                    "signed", "principal executive"]
+                who_chunks = []
+                for c in self.chunks:
+                    c_lower = c.text.lower()
+                    if any(kw in c_lower for kw in who_keywords):
+                        who_chunks.append(f"[Page {c.page_number}]: {c.text[:500]}")
+                if who_chunks:
+                    who_text = "\n\n".join(who_chunks[:8])
+                    conv_context = who_text + "\n\n" + conv_context
+
             # For financial highlights/summary questions, extract key metrics
             # from the document index so the model has real numbers
             is_highlights = bool(re.search(

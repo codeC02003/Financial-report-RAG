@@ -120,7 +120,7 @@ function EvidencePanel({ evidence }) {
               <div className="evidence-header">
                 <span className="evidence-page">Page {ev.page}</span>
                 <span className="evidence-type">{ev.type || 'text'}</span>
-                <span className="evidence-score">{Math.round((ev.score || 0) * 100)}% relevance</span>
+                <span className="evidence-score">{Math.min(99, Math.round(Math.max(0, ev.score || 0) * 100))}% relevance</span>
               </div>
               <p className="evidence-text">{ev.text?.slice(0, 200)}{ev.text?.length > 200 ? '...' : ''}</p>
             </div>
