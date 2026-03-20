@@ -17,6 +17,7 @@ qwen-vl-utils>=0.0.8
 # Embeddings & Retrieval
 sentence-transformers>=3.0.0
 faiss-cpu>=1.8.0
+whoosh>=2.7.4
 
 # Table Extraction
 camelot-py[base]>=0.11.0
