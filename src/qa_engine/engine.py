@@ -174,6 +174,9 @@ def _match_label(query_terms: list[str], doc_index: DocumentIndex) -> str | None
                         "balance", "items", "period", "change", "years", "notes", "ratio"}
         if label_lower in _skip_labels:
             continue
+        # Skip header/section labels that don't contain extractable values
+        if label_lower.startswith("headers:") or "disaggregated" in label_lower:
+            continue
 
         # Exact match — still collect as candidate (don't return early)
         # because a "Total X" variant may be better
@@ -293,7 +296,10 @@ def _expand_query_with_synonyms(terms: list[str], doc_index: DocumentIndex) -> l
         return terms
 
     _bad_qualifiers = {"deferred", "accrued", "other", "non-current", "prepaid",
-                        "accumulated", "provision", "allowance", "change in"}
+                        "accumulated", "provision", "allowance", "change in",
+                        "disaggregated", "headers:", "classification", "supplemental",
+                        "internal revenue", "code section", "adjustment to",
+                        "foreign currency", "translation"}
 
     # Check if original terms match a GOOD label (total or unqualified)
     # Require the match to be substantial (label covers at least 60% of query length)
@@ -791,7 +797,8 @@ class DocumentQAEngine:
             r'describe|explain|highlights|main risks|key (findings|points|takeaways)|'
             r'which company|whose (report|annual|document)|what company|'
             r'who (is the|are the)|what is this (report|document|filing)|'
-            r'annual report .* (about|for)|what (are|is) the main',
+            r'annual report .* (about|for)|what (are|is) the main|'
+            r'(major|main|key) segments|business segments|what segments',
             q_lower
         ))
         if is_conversational:
