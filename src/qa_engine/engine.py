@@ -347,19 +347,24 @@ def _expand_query_with_synonyms(terms: list[str], doc_index: DocumentIndex) -> l
 
     # Fuzzy match: handle typos (e.g. "avenue" → "revenue")
     # Check each query term against synonym triggers using edit distance
+    # Prefer triggers that match ALL query terms (not just the typo'd one)
+    other_terms = set(t for t in terms if len(t) >= 2)
     for term in terms:
         if len(term) < 4:
             continue
-        best_match = None
-        best_ratio = 0.0
+        candidates = []
         for trigger in sorted_triggers:
-            # Check each word in the trigger against the term
             for tword in trigger.split():
                 ratio = difflib.SequenceMatcher(None, term, tword).ratio()
-                if ratio > best_ratio and ratio >= 0.75:
-                    best_ratio = ratio
-                    best_match = trigger
-        if best_match:
+                if ratio >= 0.75:
+                    # Bonus: trigger contains other query terms (e.g. "net" in "net income")
+                    overlap = sum(1 for ot in other_terms if ot in trigger and ot != term)
+                    candidates.append((trigger, ratio + overlap * 0.5))
+                    break
+        if candidates:
+            # Pick best: highest combined score (ratio + term overlap)
+            candidates.sort(key=lambda x: x[1], reverse=True)
+            best_match = candidates[0][0]
             for alt in _FINANCIAL_SYNONYMS[best_match]:
                 alt_lower = alt.lower()
                 for label_lower in doc_index.table_labels:
@@ -602,10 +607,19 @@ def _try_table_extraction(question: str, chunks: list,
     trend_match = re.search(
         r'when did (?:the )?(.+?)\s+(increas|decreas|grow|drop|rise|fall)', q_lower)
     if not trend_match:
-        # Also match "show me X trend" or "X trend over years"
+        # "show me X trend" or "X trend over years"
         trend_match2 = re.search(r'(?:show|give)\s+(?:me\s+)?(?:the\s+)?(.+?)\s+trend', q_lower)
         if trend_match2:
             trend_match = trend_match2
+    if not trend_match:
+        # "how did X change over the years" / "how has X changed"
+        trend_match3 = re.search(
+            r'how (?:did|has|have|does) (?:the )?(.+?)\s+'
+            r'(?:change|changed|varied|evolved|moved|trended|performed)'
+            r'(?:\s+over|\s+across|\s+through|\s+in recent|\s+from|\s+between)?',
+            q_lower)
+        if trend_match3:
+            trend_match = trend_match3
     if trend_match:
         terms = _extract_terms(trend_match.group(1))
         if terms:
@@ -693,6 +707,88 @@ def _try_table_extraction(question: str, chunks: list,
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Follow-up suggestion generation (rule-based, no LLM call)
+# ──────────────────────────────────────────────────────────────────────
+
+def _generate_followups(question: str, method: str,
+                        doc_index: DocumentIndex | None) -> list[str]:
+    """Generate 3 contextual follow-up questions based on topic and method."""
+    q_lower = question.lower()
+    terms = _extract_terms(question)
+    topic = " ".join(terms[:3]) if terms else ""
+    years = sorted(doc_index.fiscal_years) if doc_index and doc_index.fiscal_years else []
+    followups = []
+
+    if any(t in q_lower for t in ["revenue", "sales", "net sales"]):
+        followups = [
+            "What was the net income?",
+            f"How did revenue change from {years[0]} to {years[-1]}?" if len(years) >= 2
+            else "What are the operating expenses?",
+            "What is the gross margin percentage?",
+        ]
+    elif any(t in q_lower for t in ["income", "profit", "earnings"]):
+        followups = [
+            "What was total revenue?",
+            f"How did net income change from {years[0]} to {years[-1]}?" if len(years) >= 2
+            else "What are the main expenses?",
+            "What are the major risk factors?",
+        ]
+    elif any(t in q_lower for t in ["asset", "liabilit", "equity", "balance"]):
+        followups = [
+            "What are total liabilities?",
+            "How much debt does the company have?",
+            "What is total shareholders' equity?",
+        ]
+    elif any(t in q_lower for t in ["risk", "threat", "challenge"]):
+        followups = [
+            "Is the company profitable?",
+            "What are the main business segments?",
+            "How much debt does the company have?",
+        ]
+    elif any(t in q_lower for t in ["summary", "summarize", "overview", "about", "document"]):
+        followups = [
+            "What are the key financial highlights?",
+            "What are the main risk factors?",
+            "What was total revenue?",
+        ]
+    elif any(t in q_lower for t in ["trend", "change", "over the years"]):
+        followups = [
+            f"What was the {topic}?" if topic else "What was total revenue?",
+            "What caused the changes?",
+            "Summarize the financial performance",
+        ]
+    elif any(t in q_lower for t in ["compare", "difference", "versus", "vs"]):
+        followups = [
+            f"Show me the {topic} trend" if topic else "How did revenue change over the years?",
+            "What drove this change?",
+            "Summarize financial performance",
+        ]
+    elif any(t in q_lower for t in ["debt", "borrow", "loan"]):
+        followups = [
+            "What are the total liabilities?",
+            "Is the company profitable?",
+            "What are the main risk factors?",
+        ]
+    else:
+        followups = [
+            f"How did {topic} change over the years?" if topic and len(years) >= 2
+            else "What are the key financial highlights?",
+            "What are the main risk factors?",
+            "Summarize the financial performance",
+        ]
+
+    # Deduplicate and exclude the current question
+    seen = set()
+    unique = []
+    for f in followups:
+        fl = f.lower().strip()
+        if fl not in seen and fl != q_lower.strip():
+            seen.add(fl)
+            unique.append(f)
+    return unique[:3]
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Main Engine
 # ──────────────────────────────────────────────────────────────────────
 
@@ -706,6 +802,7 @@ class QAResult:
     evidence_chunks: list[dict]
     used_vision: bool
     method: str = "unknown"
+    follow_ups: list[str] = field(default_factory=list)
 
 
 class DocumentQAEngine:
@@ -753,8 +850,8 @@ class DocumentQAEngine:
         self.document = self.extractor.extract(pdf_path, max_pages=max_pages)
         self.chunks = self.chunker.chunk_document(self.document)
         self.embedder.index_chunks(self.chunks)
-        self._doc_overview = self._build_document_overview()
         self._doc_index = DocumentIndex.build(self.chunks)
+        self._doc_overview = self._build_document_overview()
 
         return {
             "file_path": pdf_path,
@@ -774,7 +871,45 @@ class DocumentQAEngine:
             if meta.get(key):
                 parts.append(f"{key.title()}: {meta[key]}")
         parts.append(f"Total Pages: {self.document.total_pages}")
-        for page in self.document.pages[:5]:
+
+        # Include key metrics from the document index
+        if self._doc_index and self._doc_index.table_labels:
+            metrics = []
+            _overview_labels = [
+                "revenue", "net sales", "total net sales", "total revenue",
+                "net income", "operating income", "total assets",
+                "total liabilities", "total shareholders equity",
+                "total stockholders equity", "cash and cash equivalents",
+            ]
+            all_cd = [{"text": c.text, "chunk_id": c.chunk_id,
+                        "page_number": c.page_number, "chunk_type": c.chunk_type}
+                       for c in self.chunks]
+            _skip_overview = {"internal revenue", "code section", "headers:",
+                              "disaggregated", "deferred", "accrued", "supplemental"}
+            seen = set()
+            for target in _overview_labels:
+                for label_lower, label_orig in self._doc_index.table_labels.items():
+                    if target in label_lower and label_lower not in seen:
+                        # Skip polluted labels
+                        if any(s in label_lower for s in _skip_overview):
+                            continue
+                        row = _find_row_values(label_orig, all_cd)
+                        if row:
+                            seen.add(label_lower)
+                            yr = self._doc_index.most_recent_year or "Latest"
+                            metrics.append(f"  {label_orig}: ${row[0]:,} ({yr})")
+                            if len(metrics) >= 6:
+                                break
+                if len(metrics) >= 6:
+                    break
+            if metrics:
+                parts.append("Key Financial Data:")
+                parts.extend(metrics)
+            if self._doc_index.fiscal_years:
+                parts.append(f"Fiscal Years Covered: {', '.join(str(y) for y in self._doc_index.fiscal_years)}")
+
+        # First pages for document-level context
+        for page in self.document.pages[:3]:
             if page.text and len(page.text.strip()) > 50:
                 parts.append(f"[Page {page.page_number}]: {page.text[:500]}")
         return "\n".join(parts)
@@ -829,10 +964,30 @@ class DocumentQAEngine:
 
         # Build context (table chunks first for better model input)
         table_first = sorted(results, key=lambda x: x[0].chunk_type != "table")
-        context_text = "\n\n".join(
+
+        # Expand context with adjacent chunks from the same pages
+        # This ensures we never miss data split across chunk boundaries
+        retrieved_ids = set(c.chunk_id for c, _ in results)
+        adjacent = []
+        for chunk, _score in results:
+            for adj in self.chunks:
+                if adj.chunk_id not in retrieved_ids and adj.page_number == chunk.page_number:
+                    adjacent.append(adj)
+                    retrieved_ids.add(adj.chunk_id)
+        # Build full context: retrieved (table-first) + adjacent (sorted by page)
+        adjacent.sort(key=lambda c: (c.page_number, c.chunk_type != "table"))
+        context_parts = [
             f"[Page {c.page_number}, {c.chunk_type}]: {c.text}"
             for c, _ in table_first
-        )
+        ] + [
+            f"[Page {c.page_number}, {c.chunk_type}]: {c.text}"
+            for c in adjacent
+        ]
+        # Include doc overview at the top for broader context
+        if self._doc_overview:
+            context_text = f"Document Overview:\n{self._doc_overview[:1500]}\n\n" + "\n\n".join(context_parts)
+        else:
+            context_text = "\n\n".join(context_parts)
         evidence = [
             {"chunk_id": c.chunk_id, "page": c.page_number,
              "type": c.chunk_type, "score": round(s, 4), "text": c.text[:300]}
@@ -845,11 +1000,12 @@ class DocumentQAEngine:
         ]
 
         def _result(answer, confidence, unanswerable=False, vision=False, method="unknown"):
+            followups = _generate_followups(original_question, method, self._doc_index) if not unanswerable else []
             return QAResult(
                 question=original_question, answer=answer,
                 confidence=confidence, is_unanswerable=unanswerable,
                 source_pages=source_pages, evidence_chunks=evidence,
-                used_vision=vision, method=method,
+                used_vision=vision, method=method, follow_ups=followups,
             )
 
         # --- Stage 0: Unanswerable heuristic (before table extraction) ---
@@ -977,18 +1133,26 @@ class DocumentQAEngine:
                                     table_question = f"{subject} {original_question}"
                                 logger.info(f"Follow-up enriched: '{original_question}' -> '{table_question}'")
                             break
-        # First try on retrieved chunks (most relevant)
-        table_answer = _try_table_extraction(table_question, chunk_dicts, self._doc_index)
-        if not table_answer:
-            # Fall back to ALL document chunks (text + table)
-            all_chunk_dicts = [
-                {"text": c.text, "chunk_id": c.chunk_id,
-                 "page_number": c.page_number, "chunk_type": c.chunk_type}
-                for c in self.chunks
-            ]
-            table_answer = _try_table_extraction(table_question, all_chunk_dicts, self._doc_index)
+        # Table extraction is a structured label lookup — always search ALL chunks
+        # so that typo'd queries (which retrieve wrong pages) still find the right table.
+        all_chunk_dicts = [
+            {"text": c.text, "chunk_id": c.chunk_id,
+             "page_number": c.page_number, "chunk_type": c.chunk_type}
+            for c in self.chunks
+        ]
+        table_answer = _try_table_extraction(table_question, all_chunk_dicts, self._doc_index)
         if table_answer:
-            return _result(table_answer, 0.85, method="table")
+            # Only elaborate complex answers (trends, comparisons, percentages).
+            # Simple value lookups (e.g. "$74,391") don't need elaboration —
+            # the VLM can actually corrupt them by substituting wrong values from context.
+            is_simple_value = bool(re.match(r'^\$[\d,]+$', table_answer.strip()))
+            if is_simple_value:
+                return _result(table_answer, 0.85, method="table")
+            elab = self.vision_model.elaborate(question, table_answer, context_text, self._doc_overview)
+            elaborated = elab["answer"]
+            if elab["is_unanswerable"] or len(elaborated.strip()) < 5:
+                elaborated = table_answer
+            return _result(elaborated, 0.85, method="table")
 
         # --- Stage 2: Charts → vision model ---
         if has_charts and source_pages and self._pdf_path:
@@ -1000,7 +1164,7 @@ class DocumentQAEngine:
         # --- Stage 3: Extractive QA ---
         ext = self.extractive_qa.answer(question, chunk_dicts, no_answer_threshold=0.3)
 
-        # --- Stage 4: Generative model ---
+        # --- Stage 4: Generative model (always run for elaboration) ---
         gen = self.vision_model.answer_text_only(question, context_text)
 
         # --- Decide ---
@@ -1012,14 +1176,23 @@ class DocumentQAEngine:
                            0.9, unanswerable=True, method="unanswerable")
 
         if ext_ok:
-            return _result(ext["answer"], ext["confidence"], method="extractive")
+            # Elaborate the extractive span into a full answer
+            elab = self.vision_model.elaborate(question, ext["answer"], context_text, self._doc_overview)
+            elaborated = elab["answer"]
+            if elab["is_unanswerable"] or len(elaborated.strip()) < 5:
+                elaborated = ext["answer"]
+            return _result(elaborated, ext["confidence"], method="extractive")
 
         if gen_ok:
             return _result(gen["answer"], gen["confidence"], method="generative")
 
-        # Low confidence fallback
+        # Low confidence fallback — elaborate even weak extractive spans
         if not ext["is_unanswerable"] and ext["answer"].strip():
-            return _result(ext["answer"], ext["confidence"], method="extractive")
+            elab = self.vision_model.elaborate(question, ext["answer"], context_text, self._doc_overview)
+            elaborated = elab["answer"]
+            if elab["is_unanswerable"] or len(elaborated.strip()) < 5:
+                elaborated = ext["answer"]
+            return _result(elaborated, ext["confidence"], method="extractive")
 
         return _result(gen["answer"], gen["confidence"], gen["is_unanswerable"], method="generative")
 

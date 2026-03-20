@@ -6,19 +6,19 @@ import {
   FiZap, FiSearch, FiBookOpen, FiArrowRight, FiCheck,
   FiGlobe, FiShield, FiTrendingUp, FiArrowLeft, FiFile,
   FiGithub, FiMail, FiExternalLink, FiChevronUp, FiDatabase,
-  FiBarChart2, FiAlertTriangle, FiFileText
+  FiBarChart2, FiAlertTriangle, FiFileText, FiChevronRight
 } from 'react-icons/fi';
 import { uploadDocument, askQuestion, getPageImage } from './api';
 import './App.css';
 
 // ─── Method badge config ───
 const METHOD_CONFIG = {
-  table:          { label: '📊 Table Extraction',  color: '#10b981', bg: 'rgba(16,185,129,0.12)' },
-  extractive:     { label: '🔍 Extractive QA',     color: '#3b82f6', bg: 'rgba(59,130,246,0.12)' },
-  vision:         { label: '👁 Vision AI',          color: '#8b5cf6', bg: 'rgba(139,92,246,0.12)' },
-  generative:     { label: '🤖 Generative AI',     color: '#f59e0b', bg: 'rgba(245,158,11,0.12)' },
-  conversational: { label: '💬 Conversational',     color: '#f43f5e', bg: 'rgba(244,63,94,0.12)' },
-  unanswerable:   { label: '❓ Unanswerable',       color: '#6b7280', bg: 'rgba(107,114,128,0.12)' },
+  table:          { label: 'Table Extraction',  icon: '📊', color: '#10b981', bg: 'rgba(16,185,129,0.12)' },
+  extractive:     { label: 'Extractive QA',     icon: '🔍', color: '#3b82f6', bg: 'rgba(59,130,246,0.12)' },
+  vision:         { label: 'Vision AI',          icon: '👁', color: '#8b5cf6', bg: 'rgba(139,92,246,0.12)' },
+  generative:     { label: 'Generative AI',     icon: '🤖', color: '#f59e0b', bg: 'rgba(245,158,11,0.12)' },
+  conversational: { label: 'Conversational',     icon: '💬', color: '#f43f5e', bg: 'rgba(244,63,94,0.12)' },
+  unanswerable:   { label: 'Unanswerable',       icon: '❓', color: '#6b7280', bg: 'rgba(107,114,128,0.12)' },
 };
 
 // ─── Question categories ───
@@ -27,22 +27,78 @@ const QUESTION_CATEGORIES = {
   Trends:     ['How did revenue change over the years?', 'When did net income increase?', 'What are the growth trends?'],
   Comparison: ['Compare 2024 vs 2023 revenue', 'Difference in operating expenses', 'Compare revenue across segments'],
   Risks:      ['What are the main risks?', 'What legal proceedings exist?', 'What are the major risk factors?'],
-  Summary:    ['Summarize financial performance', 'What is this document about?', 'What caused the increase in net income?'],
+  Summary:    ['Summarize financial performance', 'What is this document about?', 'Key financial highlights'],
 };
 
-// ─── Loading text component ───
+// ─── Answer rendering (supports bold, bullets, line breaks) ───
+function renderAnswer(text) {
+  if (!text) return null;
+  const lines = text.split('\n');
+  const elements = [];
+  let bulletGroup = [];
+  let key = 0;
+
+  const flushBullets = () => {
+    if (bulletGroup.length > 0) {
+      elements.push(
+        <ul key={`ul-${key++}`} className="answer-list">
+          {bulletGroup.map((b, i) => <li key={i}>{formatInline(b)}</li>)}
+        </ul>
+      );
+      bulletGroup = [];
+    }
+  };
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) { flushBullets(); continue; }
+    if (/^[-•*]\s+/.test(trimmed)) {
+      bulletGroup.push(trimmed.replace(/^[-•*]\s+/, ''));
+    } else {
+      flushBullets();
+      elements.push(<p key={`p-${key++}`} className="answer-para">{formatInline(trimmed)}</p>);
+    }
+  }
+  flushBullets();
+  return elements.length > 0 ? elements : text;
+}
+
+function formatInline(text) {
+  const parts = text.split(/(\*\*.+?\*\*)/g);
+  return parts.map((part, i) => {
+    if (part.startsWith('**') && part.endsWith('**')) {
+      return <strong key={i} className="answer-bold">{part.slice(2, -2)}</strong>;
+    }
+    return part;
+  });
+}
+
+// ─── Loading text component (4-stage) ───
 function LoadingIndicator() {
   const [phase, setPhase] = useState(0);
   useEffect(() => {
-    const timer = setTimeout(() => setPhase(1), 2000);
-    return () => clearTimeout(timer);
+    const t1 = setTimeout(() => setPhase(1), 1500);
+    const t2 = setTimeout(() => setPhase(2), 4000);
+    const t3 = setTimeout(() => setPhase(3), 8000);
+    return () => { clearTimeout(t1); clearTimeout(t2); clearTimeout(t3); };
   }, []);
+  const stages = [
+    'Searching document...',
+    'Reranking results...',
+    'Analyzing context...',
+    'Generating answer...',
+  ];
   return (
     <div className="loading-indicator-row">
       <div className="typing-dots"><span /><span /><span /></div>
-      <span className="loading-status-text">
-        {phase === 0 ? 'Retrieving relevant chunks...' : 'Analyzing document...'}
-      </span>
+      <div className="loading-stage-info">
+        <span className="loading-status-text">{stages[phase]}</span>
+        <div className="loading-progress">
+          {stages.map((s, i) => (
+            <div key={i} className={`loading-progress-dot ${i <= phase ? 'active' : ''}`} />
+          ))}
+        </div>
+      </div>
     </div>
   );
 }
@@ -71,6 +127,23 @@ function EvidencePanel({ evidence }) {
           ))}
         </div>
       )}
+    </div>
+  );
+}
+
+// ─── Follow-up chips ───
+function FollowUpChips({ followUps, onAsk, disabled }) {
+  if (!followUps || followUps.length === 0) return null;
+  return (
+    <div className="followup-section">
+      <span className="followup-label">Ask next:</span>
+      <div className="followup-chips">
+        {followUps.map((q) => (
+          <button key={q} className="followup-chip" onClick={() => onAsk(q)} disabled={disabled}>
+            <FiChevronRight className="followup-icon" /> {q}
+          </button>
+        ))}
+      </div>
     </div>
   );
 }
@@ -221,6 +294,7 @@ function App() {
             evidence: [],
             used_vision: false,
             method: 'unanswerable',
+            follow_ups: [],
           }
         }];
       });
@@ -252,7 +326,7 @@ function App() {
     const cfg = METHOD_CONFIG[method] || METHOD_CONFIG.generative;
     return (
       <span className="method-badge" style={{ color: cfg.color, background: cfg.bg }}>
-        {cfg.label}
+        {cfg.icon} {cfg.label}
       </span>
     );
   };
@@ -267,9 +341,35 @@ function App() {
       <div className="pipeline-row done"><FiCheck className="pipeline-icon success" /> Extracted text ({pages} pages)</div>
       <div className="pipeline-row done"><FiCheck className="pipeline-icon success" /> Detected {tables} tables, {charts} charts</div>
       <div className="pipeline-row done"><FiCheck className="pipeline-icon success" /> Built search index ({chunks} chunks)</div>
-      <div className="pipeline-row ready">🚀 Ready for questions!</div>
+      <div className="pipeline-row ready">Ready for questions!</div>
     </div>
   );
+
+  // ─── Page navigator ───
+  const PageNavigator = () => {
+    if (!docInfo || !currentPage) return null;
+    return (
+      <div className="page-nav">
+        <button
+          className="page-nav-btn"
+          onClick={() => { loadPage(Math.max(1, currentPage - 1)); setShowPageViewer(true); }}
+          disabled={currentPage <= 1}
+        >
+          <FiArrowLeft />
+        </button>
+        <button className="page-nav-current" onClick={() => setShowPageViewer(true)}>
+          <FiFile /> Page {currentPage} / {docInfo.pages_processed}
+        </button>
+        <button
+          className="page-nav-btn"
+          onClick={() => { loadPage(Math.min(docInfo.pages_processed, currentPage + 1)); setShowPageViewer(true); }}
+          disabled={currentPage >= docInfo.pages_processed}
+        >
+          <FiArrowRight />
+        </button>
+      </div>
+    );
+  };
 
   // ─── Fullscreen Chat View ───
   if (chatOpen) {
@@ -282,7 +382,23 @@ function App() {
               <button onClick={() => setShowPageViewer(false)} className="page-overlay-back">
                 <FiArrowLeft /> Back to Chat
               </button>
-              <span className="page-overlay-title">Page {currentPage}</span>
+              <span className="page-overlay-title">Page {currentPage} of {docInfo?.pages_processed || '?'}</span>
+              <div className="page-overlay-nav">
+                <button
+                  onClick={() => loadPage(Math.max(1, currentPage - 1))}
+                  disabled={currentPage <= 1}
+                  className="page-nav-btn-sm"
+                >
+                  <FiArrowLeft />
+                </button>
+                <button
+                  onClick={() => loadPage(Math.min(docInfo?.pages_processed || currentPage, currentPage + 1))}
+                  disabled={currentPage >= (docInfo?.pages_processed || currentPage)}
+                  className="page-nav-btn-sm"
+                >
+                  <FiArrowRight />
+                </button>
+              </div>
               <button onClick={() => setShowPageViewer(false)} className="page-overlay-close"><FiX /></button>
             </div>
             <div className="page-overlay-body">
@@ -318,11 +434,7 @@ function App() {
               </div>
             </div>
           </div>
-          {currentPageImage && (
-            <button className="chat-fs-page-btn" onClick={() => setShowPageViewer(true)}>
-              <FiFile /> Page {currentPage}
-            </button>
-          )}
+          <PageNavigator />
         </div>
 
         {/* Chat body */}
@@ -384,7 +496,9 @@ function App() {
                     <div className="msg-bot-avatar"><FiZap /></div>
                     <div className="msg-bot-content">
                       <div className={`msg-bubble bot-bubble ${d.is_unanswerable ? 'unanswerable' : ''}`}>
-                        {d.answer}
+                        <div className="answer-content">
+                          {renderAnswer(d.answer)}
+                        </div>
                       </div>
                       <div className="msg-meta">
                         {getMethodBadge(d)}
@@ -403,6 +517,7 @@ function App() {
                         )}
                       </div>
                       <EvidencePanel evidence={d.evidence} />
+                      <FollowUpChips followUps={d.follow_ups} onAsk={doAsk} disabled={isAsking} />
                     </div>
                   </div>
                 );
@@ -516,8 +631,8 @@ function App() {
           </div>
           <div className="hero-stats">
             <div className="hero-stat">
-              <span className="hero-stat-num">94%</span>
-              <span className="hero-stat-label">Accuracy (50 Questions)</span>
+              <span className="hero-stat-num">100%</span>
+              <span className="hero-stat-label">Accuracy (53 Questions)</span>
             </div>
             <div className="hero-stat-divider" />
             <div className="hero-stat">
@@ -536,10 +651,10 @@ function App() {
           <div className="features-grid">
             {[
               { icon: <FiSearch />, color: '#60a5fa', bg: 'rgba(59,130,246,0.12)', title: 'Hybrid RAG Retrieval', desc: 'BM25 keyword search combined with semantic embeddings and cross-encoder reranking — finds the most relevant chunks every time.' },
-              { icon: <FiMessageSquare />, color: '#f472b6', bg: 'rgba(244,114,182,0.12)', title: 'Conversational AI', desc: 'Ask follow-up questions naturally. "What about Services?" after asking about iPhone — it remembers the conversation.' },
+              { icon: <FiMessageSquare />, color: '#f472b6', bg: 'rgba(244,114,182,0.12)', title: 'Conversational AI', desc: 'Ask follow-up questions naturally. The system remembers your conversation and suggests smart next questions.' },
               { icon: <FiEye />, color: '#34d399', bg: 'rgba(52,211,153,0.12)', title: 'Vision Understanding', desc: 'Reads charts, graphs, and visual elements using multimodal AI. Understands what your eyes see on the page.' },
               { icon: <FiShield />, color: '#fbbf24', bg: 'rgba(251,191,36,0.12)', title: 'Unanswerable Detection', desc: 'Knows when to say "I don\'t know". If the document doesn\'t contain the answer, it tells you honestly.' },
-              { icon: <FiTrendingUp />, color: '#22d3ee', bg: 'rgba(34,211,238,0.12)', title: 'Table-Aware Financial QA', desc: 'Precisely extracts data from financial tables, computes comparisons, and identifies trends from actual document data.' },
+              { icon: <FiTrendingUp />, color: '#22d3ee', bg: 'rgba(34,211,238,0.12)', title: 'Table-Aware Financial QA', desc: 'Precisely extracts data from financial tables, computes comparisons, trends, and percentages from actual document data.' },
               { icon: <FiGlobe />, color: '#a78bfa', bg: 'rgba(167,139,250,0.12)', title: 'Any Financial Document', desc: 'Works with 10-K filings, annual reports, earnings calls, research papers, and any PDF document you throw at it.' },
             ].map((f) => (
               <div key={f.title} className="feature-card">
@@ -566,9 +681,9 @@ function App() {
               <div className="about-steps">
                 {[
                   { n: '1', title: 'Hybrid Retrieval', desc: 'BM25 keyword search + semantic embeddings + cross-encoder reranking to find the most relevant chunks.' },
-                  { n: '2', title: 'Pattern Extraction', desc: 'High-precision extractors for financial tables, comparisons, percentages, and specific facts.' },
-                  { n: '3', title: 'Extractive QA', desc: 'RoBERTa-SQuAD2 for precise span extraction — no hallucination, just exact text from the document.' },
-                  { n: '4', title: 'Generative Fallback', desc: 'Qwen2-VL for conversational answers and visual understanding when precise extraction isn\'t enough.' },
+                  { n: '2', title: 'Table Extraction', desc: 'High-precision extractors for financial tables, comparisons, percentages, and trends — zero hallucination.' },
+                  { n: '3', title: 'LLM Elaboration', desc: 'Extracted facts are enriched by Qwen2-VL into detailed, document-quality answers with full context.' },
+                  { n: '4', title: 'Smart Follow-ups', desc: 'Every answer comes with contextual follow-up suggestions to help you explore the document deeper.' },
                 ].map((s) => (
                   <div key={s.n} className="about-step">
                     <div className="step-num">{s.n}</div>
@@ -590,7 +705,8 @@ function App() {
                     'Zero hallucination on verified data',
                     'Runs locally — no data leaves your machine',
                     'Handles 100+ page documents',
-                    'Conversational follow-up questions',
+                    'Smart follow-up suggestions',
+                    'Contextual page navigation',
                   ].map(t => (
                     <div key={t} className="tech-hl"><FiCheck /> <span>{t}</span></div>
                   ))}

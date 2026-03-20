@@ -94,9 +94,11 @@ class VisionLanguageModel:
         page_image = _resize_image(page_image, MAX_IMAGE_SIZE)
 
         system_prompt = (
-            "You are a document analysis assistant. Answer questions about the document "
+            "You are a financial document analyst. Answer questions about the document "
             "based on what you can see in the image and the provided text context. "
-            "Extract specific numbers, values, and data directly. Give a concise answer. "
+            "Extract specific numbers, values, and data directly. "
+            "Give a clear, complete answer with relevant figures, years, and context. "
+            "Keep it concise but informative (2-4 sentences). "
             "Only say 'UNANSWERABLE' if the information is truly not present."
         )
 
@@ -132,17 +134,18 @@ class VisionLanguageModel:
             self.load()
 
         system_prompt = (
-            "You are a precise document analyst. Your job is to find exact values in the context.\n\n"
+            "You are a precise financial document analyst.\n\n"
             "Rules:\n"
-            "1. Find the EXACT number, name, or value in the context that answers the question.\n"
-            "2. Match row labels precisely. Read table data carefully — numbers are often "
-            "formatted with $ signs, commas, and parentheses.\n"
+            "1. Find the EXACT numbers, names, and values in the context that answer the question.\n"
+            "2. Read table data carefully — numbers are often formatted with $ signs, commas, and parentheses.\n"
             "3. When multiple years appear in a table, pick the value from the correct year column.\n"
             "4. For comparison questions, state BOTH values and the change.\n"
             "5. For percentage questions, compute: (part / total) × 100.\n"
             "6. If the question asks about something NOT in the context, say 'UNANSWERABLE'.\n"
-            "7. If the question asks about future events or data not in the document, say 'UNANSWERABLE'.\n"
-            "8. Give ONLY the answer — no explanation needed."
+            "7. Give a clear, complete answer with specific figures and context from the document.\n"
+            "8. Use **bold** for key numbers and important terms.\n"
+            "9. Use bullet points (- item) for lists when appropriate.\n"
+            "10. Keep it concise but informative — 2-4 sentences."
         )
 
         # Give the model as much context as possible (cap to avoid OOM)
@@ -162,7 +165,12 @@ class VisionLanguageModel:
         )
         # Keep on CPU
 
-        return self._generate(inputs)
+        # Allow longer generation for detailed answers
+        old_max = self.max_new_tokens
+        self.max_new_tokens = 384
+        result = self._generate(inputs)
+        self.max_new_tokens = old_max
+        return result
 
     def answer_conversational(self, question: str, context: str,
                               doc_summary: str = "") -> dict:
@@ -171,17 +179,18 @@ class VisionLanguageModel:
             self.load()
 
         system_prompt = (
-            "You are a document analysis assistant. Answer questions based on the provided context.\n\n"
+            "You are a financial document analyst. Answer questions based on the provided context.\n\n"
             "Rules:\n"
             "1. ONLY use facts, numbers, and data from the provided context.\n"
             "2. Do NOT invent or estimate numbers — only quote what appears in the context.\n"
             "3. Provide detailed, well-structured answers with specific data from the context.\n"
             "4. Quote specific text, numbers, and dates from the context.\n"
-            "5. For questions about what the document is about, look for the company name, "
+            "5. For questions about the document, look for the company name, "
             "filing type, and fiscal year on the first pages.\n"
             "6. For financial highlights, extract key revenue, income, and other figures.\n"
-            "7. Write clearly. Use bullet points for lists.\n"
-            "8. ALWAYS try to answer from the context. Only say information is not available "
+            "7. Use **bold** for key numbers and important terms.\n"
+            "8. Use bullet points (- item) for lists. Structure your answer clearly.\n"
+            "9. ALWAYS try to answer from the context. Only say information is not available "
             "as an absolute last resort when you truly cannot find anything relevant."
         )
 
@@ -208,6 +217,60 @@ class VisionLanguageModel:
         # Allow longer generation for conversational answers
         old_max = self.max_new_tokens
         self.max_new_tokens = 512
+        result = self._generate(inputs)
+        self.max_new_tokens = old_max
+        return result
+
+    def elaborate(self, question: str, extracted_fact: str,
+                  context: str, doc_overview: str = "") -> dict:
+        """Take an extracted fact and elaborate it into a full answer using document context.
+
+        This lets table extraction / extractive QA provide grounding data while
+        the LLM produces a rich, document-quality response.
+        """
+        if self.model is None:
+            self.load()
+
+        system_prompt = (
+            "You are a financial document analyst. You have been given a VERIFIED FACT "
+            "extracted from a document, along with the surrounding context.\n\n"
+            "Your job:\n"
+            "1. Write a clear, detailed answer to the user's question.\n"
+            "2. The EXTRACTED FACT below is accurate — use it as the core of your answer.\n"
+            "3. Add relevant details, context, and explanation from the document context.\n"
+            "4. For financial figures, mention the year, currency, and any year-over-year changes if visible.\n"
+            "5. Use specific numbers, names, and dates from the context — never invent data.\n"
+            "6. Keep the answer concise but informative (2-4 sentences for simple facts, more for trends/comparisons).\n"
+            "7. Use **bold** for key numbers and important terms.\n"
+            "8. Use bullet points (- item) for lists when appropriate.\n"
+            "9. Do NOT say 'based on the extracted fact' or mention the extraction process — just answer naturally."
+        )
+
+        overview_section = f"DOCUMENT OVERVIEW:\n{doc_overview[:800]}\n\n" if doc_overview else ""
+        user_content = (
+            f"EXTRACTED FACT: {extracted_fact}\n\n"
+            f"{overview_section}"
+            f"DOCUMENT CONTEXT:\n{context[:4000]}\n\n"
+            f"Question: {question}"
+        )
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ]
+
+        text_input = self.processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+
+        inputs = self.processor(
+            text=[text_input],
+            padding=True,
+            return_tensors="pt",
+        )
+
+        old_max = self.max_new_tokens
+        self.max_new_tokens = 384
         result = self._generate(inputs)
         self.max_new_tokens = old_max
         return result
