@@ -20,7 +20,10 @@ from PIL import Image
 
 from src.pdf_processing.extractor import PDFExtractor, DocumentContent
 from src.pdf_processing.chunker import DocumentChunker, Chunk
-from src.retrieval.embedder import DocumentEmbedder
+from src.retrieval.embedder import (
+    DocumentEmbedder, normalize_query, normalize_terms,
+    expand_and_normalize, ABBREVIATIONS, _expand_abbreviations,
+)
 from src.models.extractive_qa import ExtractiveQA
 from src.models.vision_model import VisionLanguageModel
 
@@ -35,6 +38,7 @@ logger = logging.getLogger(__name__)
 class DocumentIndex:
     """Index built by scanning all chunks. Stores discovered table labels and years."""
     table_labels: dict[str, str] = field(default_factory=dict)  # lower → original
+    stemmed_labels: dict[str, str] = field(default_factory=dict)  # stemmed → original
     fiscal_years: list[int] = field(default_factory=list)
     most_recent_year: int | None = None
 
@@ -129,6 +133,10 @@ class DocumentIndex:
                 # Strip apostrophes from key so "shareholders' equity" matches "shareholders equity"
                 clean_key = label.lower().replace("'", "").replace("\u2019", "")
                 idx.table_labels[clean_key] = label
+                # Also store a stemmed version for normalized matching
+                stemmed_key = normalize_query(label)
+                if stemmed_key:
+                    idx.stemmed_labels[stemmed_key] = label
 
         # Determine fiscal years: most frequent years that cluster together
         if year_counts:
@@ -139,6 +147,7 @@ class DocumentIndex:
             idx.most_recent_year = max(fiscal)
 
         logger.info(f"DocumentIndex: {len(idx.table_labels)} labels, "
+                     f"{len(idx.stemmed_labels)} stemmed labels, "
                      f"years={idx.fiscal_years}, most_recent={idx.most_recent_year}")
         return idx
 
@@ -148,7 +157,11 @@ class DocumentIndex:
 # ──────────────────────────────────────────────────────────────────────
 
 def _match_label(query_terms: list[str], doc_index: DocumentIndex) -> str | None:
-    """Find the best matching table label for the query terms using fuzzy matching.
+    """Find the best matching table label for the query terms.
+
+    Uses two matching strategies:
+    1. Unstemmed matching (exact substring, term overlap, fuzzy edit distance)
+    2. Stemmed matching via Whoosh (so "revenues" matches "revenue", "expenses" matches "expense")
 
     Prefers "total" labels over qualified ones (e.g. "Total net sales" over
     "Deferred revenue") when the query is a broad concept like "revenue".
@@ -165,44 +178,36 @@ def _match_label(query_terms: list[str], doc_index: DocumentIndex) -> str | None
         "change in", "provision", "allowance", "prepaid", "accumulated",
     })
 
+    _skip_labels = frozenset({
+        "total", "subtotal", "amount", "other", "value", "price",
+        "balance", "items", "period", "change", "years", "notes", "ratio",
+    })
+
+    # --- Pass 1: Unstemmed matching (original behavior) ---
     for label_lower, label_orig in doc_index.table_labels.items():
-        # Skip very short labels and generic standalone words
         if len(label_lower) < 4:
             continue
-        # Skip common standalone words that are too ambiguous as labels
-        _skip_labels = {"total", "subtotal", "amount", "other", "value", "price",
-                        "balance", "items", "period", "change", "years", "notes", "ratio"}
         if label_lower in _skip_labels:
             continue
-        # Skip header/section labels that don't contain extractable values
         if label_lower.startswith("headers:") or "disaggregated" in label_lower:
             continue
 
-        # Exact match — still collect as candidate (don't return early)
-        # because a "Total X" variant may be better
         if query == label_lower:
             score = 0.99
-        # Query is substring of label
         elif query in label_lower:
-            # Penalize if label adds a very different concept via "and"
-            # e.g. "total liabilities" in "total liabilities and stockholders equity"
             extra = label_lower.replace(query, "").strip()
             if " and " in extra and len(extra) > len(query) * 0.5:
-                score = 0.55  # low score — label combines different concepts
+                score = 0.55
             else:
                 score = 0.95
-        # Label is substring of query — strength depends on how much of the query it covers
         elif label_lower in query:
             coverage = len(label_lower) / max(len(query), 1)
-            # Short labels (< 30% coverage) get low scores, long labels get high scores
             if coverage < 0.3:
-                score = 0.60 + 0.20 * coverage  # short labels: 0.60-0.66
+                score = 0.60 + 0.20 * coverage
             else:
-                score = 0.90 + 0.08 * coverage  # long labels: 0.92-0.98
-        # Term overlap (including fuzzy per-term matching for typos)
+                score = 0.90 + 0.08 * coverage
         else:
             hits = sum(1 for t in query_terms if t in label_lower)
-            # Also check fuzzy per-term matches (handles typos like "avenue"→"revenue")
             if hits == 0:
                 label_words = label_lower.split()
                 fuzzy_hits = 0
@@ -223,26 +228,61 @@ def _match_label(query_terms: list[str], doc_index: DocumentIndex) -> str | None
         if score < 0.5:
             continue
 
-        # Penalize qualified/sub-item labels when query is a broad concept
         has_qualifier = any(q in label_lower for q in _qualifiers)
         has_total = "total" in label_lower
-        # Boost labels with "total" for broad queries
         is_total_bonus = has_total and not has_qualifier
 
         candidates.append((label_orig, score, len(label_lower),
                            is_total_bonus, has_qualifier))
 
+    # --- Pass 2: Stemmed matching via Whoosh (catches morphological variants) ---
+    # Only if unstemmed matching found no strong candidates (score < 0.8)
+    best_unstemmed = max((c[1] for c in candidates), default=0)
+    if best_unstemmed < 0.8 and doc_index.stemmed_labels:
+        stemmed_query = normalize_query(" ".join(query_terms))
+        stemmed_query_terms = stemmed_query.split()
+        for stemmed_label, label_orig in doc_index.stemmed_labels.items():
+            label_lower = label_orig.lower()
+            if label_lower in _skip_labels or len(label_lower) < 4:
+                continue
+            if label_lower.startswith("headers:") or "disaggregated" in label_lower:
+                continue
+
+            # Check stemmed substring match
+            if stemmed_query in stemmed_label:
+                score = 0.92
+            elif stemmed_label in stemmed_query:
+                coverage = len(stemmed_label) / max(len(stemmed_query), 1)
+                score = 0.85 + 0.10 * coverage if coverage > 0.3 else 0.55
+            else:
+                # Stemmed term overlap
+                stemmed_label_terms = stemmed_label.split()
+                hits = sum(1 for t in stemmed_query_terms if t in stemmed_label_terms)
+                if hits == len(stemmed_query_terms) and stemmed_query_terms:
+                    score = 0.88
+                elif hits > 0:
+                    score = 0.5 + 0.18 * hits
+                else:
+                    continue
+
+            if score < 0.5:
+                continue
+
+            has_qualifier = any(q in label_lower for q in _qualifiers)
+            has_total = "total" in label_lower
+            is_total_bonus = has_total and not has_qualifier
+
+            # Slight penalty for stemmed-only match (prefer exact when available)
+            candidates.append((label_orig, score - 0.02, len(label_lower),
+                               is_total_bonus, has_qualifier))
+
     if not candidates:
         return None
 
     # Sort: highest score first; within close scores (±0.15), prefer total labels
-    # This ensures "net income" (exact=0.99) beats "Total net sales" (0.65)
-    # but "Total gross margin" (0.95) beats "Gross margin" (0.99) when close
     def _sort_key(c):
         label_orig, score, label_len, is_total, has_qual = c
-        # Bucket score into bands of 0.15 — within a band, total wins
         score_band = int(score / 0.15)
-        # Penalize qualified labels
         qual_penalty = -1 if has_qual else 0
         return (score_band, is_total, qual_penalty, score, -label_len)
 
@@ -251,7 +291,23 @@ def _match_label(query_terms: list[str], doc_index: DocumentIndex) -> str | None
 
 
 def _extract_terms(question: str) -> list[str]:
-    """Extract meaningful terms from a question by removing common stop words."""
+    """Extract meaningful terms from a question using Whoosh's stemming analyzer.
+
+    Uses Whoosh to tokenize, lowercase, remove stop words, and stem.
+    Also expands abbreviations before extracting, so "COGS" becomes
+    ["cogs", "cost", "good", "sold", "cost", "sale"].
+    Falls back to manual stop-word removal if Whoosh tokens are empty.
+    """
+    # First expand abbreviations so they're included in the terms
+    expanded = _expand_abbreviations(question)
+    # Use Whoosh stemming analyzer for consistent normalization
+    stemmed = normalize_terms(expanded)
+    # Filter out year tokens and very short tokens
+    terms = [t for t in stemmed if not re.match(r'^20\d{2}$', t) and len(t) > 1]
+    if terms:
+        return terms
+
+    # Fallback: manual extraction (in case Whoosh strips everything)
     stop = frozenset({
         "what", "was", "were", "is", "are", "the", "a", "an", "in", "of", "for",
         "to", "and", "or", "how", "much", "did", "do", "does", "has", "have",
@@ -287,6 +343,22 @@ _FINANCIAL_SYNONYMS: dict[str, list[str]] = {
     "debt": ["long-term debt", "total debt", "short-term borrowings",
              "total liabilities"],
     "liabilities": ["total current liabilities"],
+    # Abbreviation expansions (for table label matching)
+    "cogs": ["cost of goods sold", "cost of sales"],
+    "sga": ["selling general and administrative"],
+    "r&d": ["research and development"],
+    "eps": ["earnings per share"],
+    "ebitda": ["earnings before interest taxes depreciation amortization"],
+    "ebit": ["earnings before interest and taxes", "operating income"],
+    "opex": ["total operating expenses", "operating expenses"],
+    "capex": ["capital expenditures"],
+    "pp&e": ["property plant and equipment"],
+    "ppe": ["property plant and equipment"],
+    "fcf": ["free cash flow"],
+    "mda": ["management discussion and analysis"],
+    "d&a": ["depreciation and amortization"],
+    "ar": ["accounts receivable"],
+    "ap": ["accounts payable"],
 }
 
 
@@ -1208,6 +1280,63 @@ class DocumentQAEngine:
 
         if gen_ok:
             return _result(gen["answer"], gen["confidence"], method="generative")
+
+        # --- Confidence-based retry with reformulated query ---
+        # If both extractive and generative returned low confidence,
+        # try expanding the query with synonyms and re-retrieving
+        if not hasattr(self, '_retry_attempted'):
+            self._retry_attempted = False
+
+        both_weak = (
+            (ext["is_unanswerable"] or ext["confidence"] < 0.45)
+            and (gen["is_unanswerable"] or gen["confidence"] < 0.45)
+            and not self._retry_attempted
+        )
+        if both_weak:
+            self._retry_attempted = True
+            try:
+                # Reformulate: expand with synonyms + abbreviations
+                retry_terms = _extract_terms(question)
+                if retry_terms and self._doc_index:
+                    expanded = _expand_query_with_synonyms(retry_terms, self._doc_index)
+                    retry_query = " ".join(expanded)
+                    if retry_query != question.lower().strip():
+                        logger.info(f"Low-confidence retry: '{question}' → '{retry_query}'")
+                        retry_results = self.embedder.search(
+                            retry_query, top_k=max(top_k, 10),
+                            threshold=retrieval_cfg.get("similarity_threshold", 0.1),
+                        )
+                        if retry_results:
+                            retry_chunks = [
+                                {"text": c.text, "chunk_id": c.chunk_id,
+                                 "page_number": c.page_number, "chunk_type": c.chunk_type}
+                                for c, _ in retry_results
+                            ]
+                            retry_context = "\n\n".join(
+                                f"[Page {c.page_number}, {c.chunk_type}]: {c.text}"
+                                for c, _ in retry_results
+                            )
+                            if self._doc_overview:
+                                retry_context = f"Document Overview:\n{self._doc_overview[:1500]}\n\n" + retry_context
+
+                            # Try extractive on new chunks
+                            ext2 = self.extractive_qa.answer(question, retry_chunks, no_answer_threshold=0.3)
+                            if not ext2["is_unanswerable"] and ext2["confidence"] >= 0.5:
+                                elab = self.vision_model.elaborate(
+                                    question, ext2["answer"], retry_context, self._doc_overview)
+                                elaborated = elab["answer"]
+                                if elab["is_unanswerable"] or len(elaborated.strip()) < 5:
+                                    elaborated = ext2["answer"]
+                                return _result(elaborated, ext2["confidence"], method="extractive")
+
+                            # Try generative on new context
+                            gen2 = self.vision_model.answer_text_only(question, retry_context)
+                            if not gen2["is_unanswerable"] and gen2["confidence"] >= 0.45:
+                                return _result(gen2["answer"], gen2["confidence"], method="generative")
+            except Exception as e:
+                logger.warning(f"Confidence retry failed: {e}")
+            finally:
+                self._retry_attempted = False
 
         # Low confidence fallback — elaborate even weak extractive spans
         if not ext["is_unanswerable"] and ext["answer"].strip():

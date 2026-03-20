@@ -48,12 +48,54 @@ class DocumentChunker:
         self.chunk_overlap = chunk_overlap
 
     def chunk_document(self, document: DocumentContent) -> list[Chunk]:
-        """Split a full document into chunks."""
+        """Split a full document into chunks, then deduplicate near-identical content."""
         chunks = []
         for page in document.pages:
             page_chunks = self._chunk_page(page, document.file_path)
             chunks.extend(page_chunks)
-        return chunks
+        return self._deduplicate(chunks)
+
+    @staticmethod
+    def _deduplicate(chunks: list[Chunk], similarity_threshold: float = 0.85) -> list[Chunk]:
+        """Remove near-duplicate chunks that bloat context without adding info.
+
+        Uses a normalized text fingerprint (lowered, whitespace-collapsed, sorted words)
+        and Jaccard similarity. Keeps the first occurrence (earlier page wins).
+        Only deduplicates within the same chunk_type to avoid dropping a table
+        chunk that overlaps with a text chunk.
+        """
+        kept: list[Chunk] = []
+        seen_fingerprints: list[tuple[set[str], str]] = []  # (word_set, chunk_type)
+
+        for chunk in chunks:
+            # Build word-set fingerprint
+            words = set(re.sub(r'[^\w\s]', '', chunk.text.lower()).split())
+            if not words:
+                kept.append(chunk)
+                continue
+
+            is_dup = False
+            for existing_words, existing_type in seen_fingerprints:
+                if existing_type != chunk.chunk_type:
+                    continue
+                # Jaccard similarity
+                intersection = len(words & existing_words)
+                union = len(words | existing_words)
+                if union > 0 and intersection / union >= similarity_threshold:
+                    is_dup = True
+                    break
+
+            if not is_dup:
+                kept.append(chunk)
+                seen_fingerprints.append((words, chunk.chunk_type))
+
+        removed = len(chunks) - len(kept)
+        if removed > 0:
+            import logging
+            logging.getLogger(__name__).info(
+                f"Deduplication: removed {removed} near-duplicate chunks "
+                f"({len(chunks)} → {len(kept)})")
+        return kept
 
     def _chunk_page(self, page: PageContent, file_path: str) -> list[Chunk]:
         """Split a single page into chunks."""
@@ -81,6 +123,9 @@ class DocumentChunker:
         text = page.text.strip()
         if not text:
             return chunks
+
+        # Clean mangled financial table text (label/$/ number on separate lines)
+        text = self._clean_financial_text(text)
 
         segments = self._recursive_split(text)
         text_chunks = self._group_segments(segments, page.page_number, base_meta)
