@@ -184,7 +184,13 @@ def _match_label(query_terms: list[str], doc_index: DocumentIndex) -> str | None
             score = 0.99
         # Query is substring of label
         elif query in label_lower:
-            score = 0.95
+            # Penalize if label adds a very different concept via "and"
+            # e.g. "total liabilities" in "total liabilities and stockholders equity"
+            extra = label_lower.replace(query, "").strip()
+            if " and " in extra and len(extra) > len(query) * 0.5:
+                score = 0.55  # low score — label combines different concepts
+            else:
+                score = 0.95
         # Label is substring of query — strength depends on how much of the query it covers
         elif label_lower in query:
             coverage = len(label_lower) / max(len(query), 1)
@@ -267,14 +273,20 @@ _FINANCIAL_SYNONYMS: dict[str, list[str]] = {
     "net sales": ["total net sales"],
     "income": ["net income"],
     "net income": ["net income"],
+    "operating income": ["income from operations", "operating income"],
     "profit": ["net income", "operating income"],
+    "operating profit": ["income from operations", "operating income"],
     "money": ["net income", "total net sales"],
     "cost sales": ["total cost of sales", "cost of sales"],
     "cost of sales": ["total cost of sales"],
     "equity": ["total shareholders equity", "total stockholders equity",
                "shareholders equity", "stockholders equity"],
-    "operating expenses": ["total operating expenses"],
+    "operating expenses": ["total operating expenses", "operating expenses"],
     "gross margin": ["total gross margin", "gross margin"],
+    "gross profit": ["total gross margin", "gross margin", "gross profit"],
+    "debt": ["long-term debt", "total debt", "short-term borrowings",
+             "total liabilities"],
+    "liabilities": ["total current liabilities"],
 }
 
 
@@ -310,8 +322,17 @@ def _expand_query_with_synonyms(terms: list[str], doc_index: DocumentIndex) -> l
             if overlap < len(query) * 0.6:
                 continue
             has_qualifier = any(q in label_lower for q in _bad_qualifiers)
-            if not has_qualifier:
-                return terms
+            if has_qualifier:
+                continue
+            # Skip if label combines concepts via "and" (e.g. "liabilities and equity")
+            if query in label_lower:
+                extra = label_lower.replace(query, "").strip()
+                if re.search(r'\band\b', extra) and len(extra) > len(query) * 0.4:
+                    continue
+            # Skip if query says "total X" but label is just "X" (section header)
+            if label_lower in query and "total" in query and "total" not in label_lower:
+                continue
+            return terms
 
     # Try synonyms — check longer (more specific) triggers first
     # e.g. "cost sales" should match before bare "sales"
@@ -497,14 +518,34 @@ def _try_table_extraction(question: str, chunks: list,
 
     q_lower = question.lower()
 
-    # Skip question types that need model reasoning
+    # Skip question types that need model reasoning (not table lookup)
     skip_types = [
+        # Conversational / descriptive
         "summarize", "summary", "overview", "describe", "explain",
         "risks", "what is this document", "highlights",
-        "who is", "where is", "what are", "what is this",
-        "increase or decrease", "how many employees",
-        "fiscal year end", "earnings per", "eps",
-        "which .+ had the highest", "which .+ is the",
+        "who is", "where is", "what are the", "what is this",
+        "tell me about", "break down", "breakdown",
+        # Identity / metadata (not financial values)
+        "when was .+ filed", "what type of", "what kind of",
+        "what exchange", "ticker symbol", "which exchange",
+        "fiscal year end", "what date",
+        # Yes/no / qualitative questions
+        "increase or decrease", "is the company", "is it", "does the company",
+        "did the company", "are there", "was there",
+        # Questions about HOW/WHY (need reasoning, not a number)
+        "how does", "how do they", "how is .+ generated", "why did",
+        "what caused", "what drove", "what led to",
+        # Non-numeric lookups
+        "how many employees", "how many stores", "how many locations",
+        "earnings per", "eps",
+        # Superlative / ranking
+        "which .+ had the highest", "which .+ is the", "what is the largest",
+        # Vague / broad comparisons without years
+        "what changed", "what.s different", "what happened",
+        # Worth / valuation (not in 10-K tables)
+        "company worth", "market value", "valuation",
+        # Vague yes/no questions about financials
+        "any debt", "any risk", "any issue",
     ]
     for pat in skip_types:
         if re.search(pat, q_lower):
@@ -560,6 +601,11 @@ def _try_table_extraction(question: str, chunks: list,
     # --- Trend questions ---
     trend_match = re.search(
         r'when did (?:the )?(.+?)\s+(increas|decreas|grow|drop|rise|fall)', q_lower)
+    if not trend_match:
+        # Also match "show me X trend" or "X trend over years"
+        trend_match2 = re.search(r'(?:show|give)\s+(?:me\s+)?(?:the\s+)?(.+?)\s+trend', q_lower)
+        if trend_match2:
+            trend_match = trend_match2
     if trend_match:
         terms = _extract_terms(trend_match.group(1))
         if terms:
@@ -602,6 +648,27 @@ def _try_table_extraction(question: str, chunks: list,
                 if pct <= 100:
                     return f"{pct:.1f}%"
         return None
+
+    # --- "X percentage" or "X as a %" questions ---
+    # e.g. "What is the gross margin percentage?"
+    if re.search(r'(percentage|percent|%|ratio)\b', q_lower):
+        # Extract the metric name (remove percentage/percent keywords)
+        metric_text = re.sub(r'\b(percentage|percent|ratio|what|is|the|was)\b', '', q_lower).strip(' ?.')
+        metric_terms = _extract_terms(metric_text)
+        if metric_terms:
+            metric_terms = _expand_query_with_synonyms(metric_terms, doc_index)
+            metric_label = _match_label(metric_terms, doc_index)
+            if metric_label:
+                metric_row = _find_row_values(metric_label, chunks)
+                # Try to find the total (revenue/net sales) to compute percentage
+                rev_terms = _expand_query_with_synonyms(["revenue"], doc_index)
+                rev_label = _match_label(rev_terms, doc_index)
+                if metric_row and rev_label:
+                    rev_row = _find_row_values(rev_label, chunks)
+                    if rev_row and rev_row[0] > 0:
+                        pct = (metric_row[0] / rev_row[0]) * 100
+                        if pct <= 100:
+                            return f"{metric_label}: {pct:.1f}% of revenue (${metric_row[0]:,} / ${rev_row[0]:,})"
 
     # --- Simple value lookup (high precision: require good match) ---
     terms = _extract_terms(question)
@@ -798,7 +865,13 @@ class DocumentQAEngine:
             r'which company|whose (report|annual|document)|what company|'
             r'who (is the|are the)|what is this (report|document|filing)|'
             r'annual report .* (about|for)|what (are|is) the main|'
-            r'(major|main|key) segments|business segments|what segments',
+            r'(major|main|key) segments|business segments|what segments|'
+            r'business model|how does .+ (generate|make|earn)|what type of document|'
+            r'what exchange|ticker symbol|when was .+ filed|'
+            r'break down|breakdown|list the|what caused|what drove|'
+            r'is the company (profitable|growing|debt)|'
+            r'what changed|top risk|risk factors|what happened|'
+            r'any debt|how much debt|does .+ have debt',
             q_lower
         ))
         if is_conversational:
@@ -858,31 +931,51 @@ class DocumentQAEngine:
         # --- Stage 1: Try table extraction (fast, precise) ---
         # For follow-ups, try table extraction on the ORIGINAL question first
         # (rewritten question includes history context that pollutes label matching)
-        # But if the follow-up lacks a subject (e.g. "Difference between 2023 and 2022"),
-        # inject the subject from the last user question in history.
+        # If the follow-up is vague or lacks a subject, inject context from history.
         table_question = original_question if history else question
         if history and original_question:
-            # Check if follow-up is a diff/compare/trend question missing a subject
             oq = original_question.lower()
-            has_pattern = bool(re.search(r'(difference|change|compare|trend)', oq))
-            if has_pattern:
-                # Extract subject terms from the follow-up after removing years/keywords
+
+            # Detect if the follow-up is too vague to stand on its own
+            oq_terms = _extract_terms(original_question)
+            is_vague = len(oq_terms) <= 2 or bool(re.search(
+                r'^(how much|how many|by what|what amount|what was it|'
+                r'and (what|how)|what about|how about|tell me more|'
+                r'by how much|did it|was it|is it|can you)',
+                oq.strip()
+            ))
+
+            # Also detect diff/compare/trend questions missing a subject
+            has_pattern = bool(re.search(r'(difference|change|compare|trend|increase|decrease|grow|drop)', oq))
+
+            if is_vague or has_pattern:
+                # Extract subject terms from the follow-up
                 subj = re.sub(r'\d{4}', '', oq)
                 subj = re.sub(
-                    r'\b(difference|change|between|and|from|to|what|was|is|the|in|of|compare|tell|me|now|it|with|about)\b',
+                    r'\b(difference|change|between|and|from|to|what|was|is|the|in|of|compare|'
+                    r'tell|me|now|it|with|about|how|much|many|by|amount|did|increase|decrease|'
+                    r'grow|drop|more|can|you|that)\b',
                     '', subj).strip()
+
                 if len(subj) < 3:
-                    # No subject — get it from the last user message in history
+                    # No subject in follow-up — get it from the last user question in history
                     for msg in reversed(history):
                         if msg.get("role") == "user":
                             prev_q = msg["content"]
-                            # Extract meaningful terms from previous question
                             prev_terms = _extract_terms(prev_q)
                             if prev_terms:
                                 subject = " ".join(prev_terms)
-                                table_question = f"{subject} difference between " + " and ".join(
-                                    re.findall(r'\b(20\d{2})\b', original_question))
-                                logger.debug(f"Follow-up enriched: '{original_question}' -> '{table_question}'")
+                                # Reconstruct based on question type
+                                years_in_q = re.findall(r'\b(20\d{2})\b', original_question)
+                                if has_pattern and years_in_q:
+                                    table_question = f"{subject} difference between " + " and ".join(years_in_q)
+                                elif re.search(r'(how much|what amount|by what|by how)', oq):
+                                    table_question = f"What was {subject}"
+                                elif re.search(r'(increase|decrease|grow|drop)', oq):
+                                    table_question = f"How did {subject} change from 2023 to 2024"
+                                else:
+                                    table_question = f"{subject} {original_question}"
+                                logger.info(f"Follow-up enriched: '{original_question}' -> '{table_question}'")
                             break
         # First try on retrieved chunks (most relevant)
         table_answer = _try_table_extraction(table_question, chunk_dicts, self._doc_index)
