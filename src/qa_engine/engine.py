@@ -190,9 +190,20 @@ def _match_label(query_terms: list[str], doc_index: DocumentIndex) -> str | None
                 score = 0.60 + 0.20 * coverage  # short labels: 0.60-0.66
             else:
                 score = 0.90 + 0.08 * coverage  # long labels: 0.92-0.98
-        # Term overlap
+        # Term overlap (including fuzzy per-term matching for typos)
         else:
             hits = sum(1 for t in query_terms if t in label_lower)
+            # Also check fuzzy per-term matches (handles typos like "avenue"→"revenue")
+            if hits == 0:
+                label_words = label_lower.split()
+                fuzzy_hits = 0
+                for t in query_terms:
+                    if len(t) >= 4:
+                        for lw in label_words:
+                            if difflib.SequenceMatcher(None, t, lw).ratio() >= 0.75:
+                                fuzzy_hits += 1
+                                break
+                hits = fuzzy_hits
             if hits == len(query_terms) and query_terms:
                 score = 0.85
             elif hits > 0:
@@ -306,6 +317,28 @@ def _expand_query_with_synonyms(terms: list[str], doc_index: DocumentIndex) -> l
                 for label_lower in doc_index.table_labels:
                     if alt_lower in label_lower or label_lower in alt_lower:
                         return alt.split()
+
+    # Fuzzy match: handle typos (e.g. "avenue" → "revenue")
+    # Check each query term against synonym triggers using edit distance
+    for term in terms:
+        if len(term) < 4:
+            continue
+        best_match = None
+        best_ratio = 0.0
+        for trigger in sorted_triggers:
+            # Check each word in the trigger against the term
+            for tword in trigger.split():
+                ratio = difflib.SequenceMatcher(None, term, tword).ratio()
+                if ratio > best_ratio and ratio >= 0.75:
+                    best_ratio = ratio
+                    best_match = trigger
+        if best_match:
+            for alt in _FINANCIAL_SYNONYMS[best_match]:
+                alt_lower = alt.lower()
+                for label_lower in doc_index.table_labels:
+                    if alt_lower in label_lower or label_lower in alt_lower:
+                        return alt.split()
+
     return terms
 
 
@@ -754,12 +787,64 @@ class DocumentQAEngine:
         q_lower = question.lower()
         is_conversational = bool(re.search(
             r'summarize|summary|overview|what is this document|tell me about|'
-            r'describe|explain|highlights|main risks|key (findings|points|takeaways)',
+            r'describe|explain|highlights|main risks|key (findings|points|takeaways)|'
+            r'which company|whose (report|annual|document)|what company|'
+            r'who (is the|are the)|what is this (report|document|filing)|'
+            r'annual report .* (about|for)|what (are|is) the main',
             q_lower
         ))
         if is_conversational:
+            # For broad/conversational questions, include first-page context
+            # so the model has document-level info (company name, overview, etc.)
+            conv_context = context_text
+            if self.document and self.document.pages:
+                first_pages_text = "\n".join(
+                    f"[Page {p.page_number}]: {p.text[:800]}"
+                    for p in self.document.pages[:3]
+                    if p.text and len(p.text.strip()) > 30
+                )
+                if first_pages_text:
+                    conv_context = first_pages_text + "\n\n" + context_text
+
+            # For financial highlights/summary questions, extract key metrics
+            # from the document index so the model has real numbers
+            is_highlights = bool(re.search(
+                r'highlight|financial (summary|overview)|key (financial|metric|figure)',
+                q_lower))
+            if is_highlights and self._doc_index and self._doc_index.table_labels:
+                key_metrics = []
+                _highlight_labels = [
+                    "revenue", "net sales", "total net sales", "total revenue",
+                    "net income", "gross margin", "total gross margin",
+                    "operating income", "total assets", "total liabilities",
+                    "total shareholders equity", "total stockholders equity",
+                    "cash and cash equivalents", "cost of sales",
+                ]
+                seen = set()
+                for target in _highlight_labels:
+                    for label_lower, label_orig in self._doc_index.table_labels.items():
+                        if target in label_lower and label_lower not in seen:
+                            row = _find_row_values(label_orig, chunk_dicts)
+                            if not row:
+                                all_cd = [{"text": c.text, "chunk_id": c.chunk_id,
+                                           "page_number": c.page_number,
+                                           "chunk_type": c.chunk_type}
+                                          for c in self.chunks]
+                                row = _find_row_values(label_orig, all_cd)
+                            if row:
+                                seen.add(label_lower)
+                                yr = self._doc_index.most_recent_year or "Latest"
+                                key_metrics.append(f"- {label_orig}: ${row[0]:,} ({yr})")
+                                if len(key_metrics) >= 8:
+                                    break
+                    if len(key_metrics) >= 8:
+                        break
+                if key_metrics:
+                    metrics_text = "Key Financial Data (extracted from tables):\n" + "\n".join(key_metrics)
+                    conv_context = metrics_text + "\n\n" + conv_context
+
             r = self.vision_model.answer_conversational(
-                question, context_text, self._doc_overview)
+                question, conv_context, self._doc_overview)
             return _result(r["answer"], r["confidence"], r["is_unanswerable"])
 
         # --- Stage 1: Try table extraction (fast, precise) ---

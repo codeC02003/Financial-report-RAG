@@ -68,6 +68,9 @@ class VisionLanguageModel:
             generated_ids, skip_special_tokens=True
         )[0].strip()
 
+        # Clean up repetitive output (common with small models)
+        answer = self._clean_repetition(answer)
+
         is_unanswerable = answer.upper().startswith("UNANSWERABLE")
         confidence = self._estimate_confidence(generated_ids.shape[1], is_unanswerable)
 
@@ -172,16 +175,20 @@ class VisionLanguageModel:
             "Rules:\n"
             "1. ONLY use facts, numbers, and data from the provided context.\n"
             "2. Do NOT invent or estimate numbers — only quote what appears in the context.\n"
-            "3. Provide detailed, well-structured answers.\n"
+            "3. Provide detailed, well-structured answers with specific data from the context.\n"
             "4. Quote specific text, numbers, and dates from the context.\n"
-            "5. If information is not in the context, say so.\n"
-            "6. Write clearly. Use bullet points for lists."
+            "5. For questions about what the document is about, look for the company name, "
+            "filing type, and fiscal year on the first pages.\n"
+            "6. For financial highlights, extract key revenue, income, and other figures.\n"
+            "7. Write clearly. Use bullet points for lists.\n"
+            "8. ALWAYS try to answer from the context. Only say information is not available "
+            "as an absolute last resort when you truly cannot find anything relevant."
         )
 
         full_context = ""
         if doc_summary:
             full_context += f"Document Overview:\n{doc_summary}\n\n"
-        full_context += f"Relevant Sections:\n{context[:4000]}"
+        full_context += f"Relevant Sections:\n{context[:5000]}"
 
         messages = [
             {"role": "system", "content": system_prompt},
@@ -204,6 +211,31 @@ class VisionLanguageModel:
         result = self._generate(inputs)
         self.max_new_tokens = old_max
         return result
+
+    @staticmethod
+    def _clean_repetition(text: str) -> str:
+        """Remove degenerate repetition from model output."""
+        # Detect repeated short patterns (e.g. "(1) (26) (1) (26) ...")
+        import re
+        # Find repeating patterns of 3-30 chars that repeat 3+ times
+        match = re.search(r'(.{3,30}?)\1{2,}', text)
+        if match:
+            # Cut at the start of the repetition
+            text = text[:match.start()].rstrip(" ,;:-")
+
+        # Also detect numbered list items that repeat the same content
+        lines = text.split('\n')
+        seen_lines = set()
+        clean_lines = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped in seen_lines and len(stripped) > 10:
+                continue
+            seen_lines.add(stripped)
+            clean_lines.append(line)
+        text = '\n'.join(clean_lines)
+
+        return text.strip()
 
     def _estimate_confidence(self, generated_length: int,
                              is_unanswerable: bool) -> float:
