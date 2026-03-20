@@ -632,6 +632,7 @@ class QAResult:
     source_pages: list[int]
     evidence_chunks: list[dict]
     used_vision: bool
+    method: str = "unknown"
 
 
 class DocumentQAEngine:
@@ -770,18 +771,18 @@ class DocumentQAEngine:
             for c, _ in table_first
         ]
 
-        def _result(answer, confidence, unanswerable=False, vision=False):
+        def _result(answer, confidence, unanswerable=False, vision=False, method="unknown"):
             return QAResult(
                 question=original_question, answer=answer,
                 confidence=confidence, is_unanswerable=unanswerable,
                 source_pages=source_pages, evidence_chunks=evidence,
-                used_vision=vision,
+                used_vision=vision, method=method,
             )
 
         # --- Stage 0: Unanswerable heuristic (before table extraction) ---
         if _is_unanswerable(question, self._doc_index):
             return _result("UNANSWERABLE: The document does not contain this information.",
-                           0.9, unanswerable=True)
+                           0.9, unanswerable=True, method="unanswerable")
 
         # --- Stage 0.5: Route conversational/open-ended questions ---
         q_lower = question.lower()
@@ -845,7 +846,7 @@ class DocumentQAEngine:
 
             r = self.vision_model.answer_conversational(
                 question, conv_context, self._doc_overview)
-            return _result(r["answer"], r["confidence"], r["is_unanswerable"])
+            return _result(r["answer"], r["confidence"], r["is_unanswerable"], method="conversational")
 
         # --- Stage 1: Try table extraction (fast, precise) ---
         # For follow-ups, try table extraction on the ORIGINAL question first
@@ -887,14 +888,14 @@ class DocumentQAEngine:
             ]
             table_answer = _try_table_extraction(table_question, all_chunk_dicts, self._doc_index)
         if table_answer:
-            return _result(table_answer, 0.85)
+            return _result(table_answer, 0.85, method="table")
 
         # --- Stage 2: Charts → vision model ---
         if has_charts and source_pages and self._pdf_path:
             page_img = self.extractor.render_page_image(self._pdf_path, source_pages[0])
             if page_img:
                 r = self.vision_model.answer_with_image(question, page_img, context_text)
-                return _result(r["answer"], r["confidence"], r["is_unanswerable"], True)
+                return _result(r["answer"], r["confidence"], r["is_unanswerable"], True, method="vision")
 
         # --- Stage 3: Extractive QA ---
         ext = self.extractive_qa.answer(question, chunk_dicts, no_answer_threshold=0.3)
@@ -908,19 +909,19 @@ class DocumentQAEngine:
 
         if ext["is_unanswerable"] and gen["is_unanswerable"]:
             return _result("UNANSWERABLE: The document does not contain this information.",
-                           0.9, unanswerable=True)
+                           0.9, unanswerable=True, method="unanswerable")
 
         if ext_ok:
-            return _result(ext["answer"], ext["confidence"])
+            return _result(ext["answer"], ext["confidence"], method="extractive")
 
         if gen_ok:
-            return _result(gen["answer"], gen["confidence"])
+            return _result(gen["answer"], gen["confidence"], method="generative")
 
         # Low confidence fallback
         if not ext["is_unanswerable"] and ext["answer"].strip():
-            return _result(ext["answer"], ext["confidence"])
+            return _result(ext["answer"], ext["confidence"], method="extractive")
 
-        return _result(gen["answer"], gen["confidence"], gen["is_unanswerable"])
+        return _result(gen["answer"], gen["confidence"], gen["is_unanswerable"], method="generative")
 
     def get_page_image(self, page_number: int) -> Image.Image | None:
         if not self.document or not self._pdf_path:

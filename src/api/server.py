@@ -81,6 +81,7 @@ class QAResponse(BaseModel):
     source_pages: list[int]
     evidence: list[dict]
     used_vision: bool
+    method: str
 
 
 class DocumentInfo(BaseModel):
@@ -137,6 +138,7 @@ async def ask_question(request: QuestionRequest):
             source_pages=result.source_pages,
             evidence=result.evidence_chunks,
             used_vision=result.used_vision,
+            method=result.method,
         )
     except Exception as e:
         logger.error(f"QA failed: {e}")
