@@ -1117,25 +1117,51 @@ class DocumentQAEngine:
 
             # For "who is" questions (CEO, officers, auditor, etc.), scan all chunks
             # for relevant keywords since retrieval may miss signature/officer pages
-            is_who_q = bool(re.search(r'who (is|are|was)', q_lower))
+            is_who_q = bool(re.search(r'who (is|are|was|became|replaced)', q_lower))
             if is_who_q:
+                # Map question terms to document keywords
+                _who_term_map = {
+                    "ceo": ["chief executive officer", "ceo"],
+                    "cfo": ["chief financial officer", "cfo"],
+                    "president": ["president"],
+                    "chairman": ["chairman", "chair of the board"],
+                    "auditor": ["auditor", "audit firm", "independent registered"],
+                    "director": ["director", "board of directors"],
+                    "secretary": ["secretary"],
+                    "officer": ["officer", "executive officer"],
+                }
+                # Find which specific role the user is asking about
                 who_keywords = []
-                for kw in ["ceo", "chief executive", "president", "chairman",
-                           "chief financial", "cfo", "officer", "director",
-                           "auditor", "secretary", "board"]:
-                    if kw in q_lower:
-                        who_keywords.append(kw)
+                for term, expansions in _who_term_map.items():
+                    if term in q_lower:
+                        who_keywords.extend(expansions)
                 if not who_keywords:
-                    # Generic "who is" — search broadly
-                    who_keywords = ["chief executive", "president", "officer",
-                                    "signed", "principal executive"]
-                who_chunks = []
+                    # Generic "who is" — use broad officer keywords
+                    who_keywords = ["chief executive officer", "president",
+                                    "executive officer", "principal executive"]
+
+                # Score each chunk by how many keywords it matches (more = more relevant)
+                scored_chunks = []
                 for c in self.chunks:
                     c_lower = c.text.lower()
-                    if any(kw in c_lower for kw in who_keywords):
-                        who_chunks.append(f"[Page {c.page_number}]: {c.text[:500]}")
+                    hits = sum(1 for kw in who_keywords if kw in c_lower)
+                    if hits > 0:
+                        # Bonus for chunks with names (capitalized words near keywords)
+                        has_name = bool(re.search(
+                            r'(?:officer|ceo|president|director)[,\s]+\w+\s+[A-Z][a-z]+|'
+                            r'[A-Z][a-z]+\s+[A-Z][a-z]+\s+(?:has served|was appointed|became|resigned)',
+                            c.text))
+                        score = hits + (2 if has_name else 0)
+                        scored_chunks.append((score, c))
+
+                # Sort by relevance score (highest first) and take top 5
+                scored_chunks.sort(key=lambda x: x[0], reverse=True)
+                who_chunks = [
+                    f"[Page {c.page_number}]: {c.text[:600]}"
+                    for _, c in scored_chunks[:5]
+                ]
                 if who_chunks:
-                    who_text = "\n\n".join(who_chunks[:8])
+                    who_text = "\n\n".join(who_chunks)
                     conv_context = who_text + "\n\n" + conv_context
 
             # For financial highlights/summary questions, extract key metrics
