@@ -278,15 +278,14 @@ class VisionLanguageModel:
     @staticmethod
     def _clean_repetition(text: str) -> str:
         """Remove degenerate repetition from model output."""
-        # Detect repeated short patterns (e.g. "(1) (26) (1) (26) ...")
         import re
-        # Find repeating patterns of 3-30 chars that repeat 3+ times
+
+        # Detect repeated short patterns (e.g. "(1) (26) (1) (26) ...")
         match = re.search(r'(.{3,30}?)\1{2,}', text)
         if match:
-            # Cut at the start of the repetition
             text = text[:match.start()].rstrip(" ,;:-")
 
-        # Also detect numbered list items that repeat the same content
+        # Remove duplicate lines (exact match)
         lines = text.split('\n')
         seen_lines = set()
         clean_lines = []
@@ -296,8 +295,51 @@ class VisionLanguageModel:
                 continue
             seen_lines.add(stripped)
             clean_lines.append(line)
-        text = '\n'.join(clean_lines)
 
+        # Remove numbered list items with duplicate content
+        # e.g. "6. The change in net income is $0" and "10. The change in net income is $0"
+        # Strip the leading number/bullet to compare content
+        seen_content = set()
+        deduped_lines = []
+        for line in clean_lines:
+            stripped = line.strip()
+            # Remove leading numbering: "1.", "1)", "- ", "* ", etc.
+            content = re.sub(r'^\d+[\.\)]\s*', '', stripped)
+            content = re.sub(r'^[-*•]\s*', '', content)
+            content = content.strip()
+            if content in seen_content and len(content) > 20:
+                continue
+            if content:
+                seen_content.add(content)
+            deduped_lines.append(line)
+
+        # Detect semantic repetition: if >50% of remaining lines contain
+        # the same key phrase, the model is looping — truncate
+        if len(deduped_lines) > 4:
+            phrases = {}
+            for line in deduped_lines:
+                # Extract key phrases (>15 chars after stripping numbers)
+                content = re.sub(r'^\d+[\.\)]\s*', '', line.strip()).strip()
+                if len(content) > 15:
+                    # Use first 30 chars as fingerprint
+                    fp = content[:30].lower()
+                    phrases[fp] = phrases.get(fp, 0) + 1
+            max_repeats = max(phrases.values()) if phrases else 0
+            if max_repeats > len(deduped_lines) * 0.4:
+                # Model is looping — keep only first occurrence of each
+                final_lines = []
+                seen_fp = set()
+                for line in deduped_lines:
+                    content = re.sub(r'^\d+[\.\)]\s*', '', line.strip()).strip()
+                    fp = content[:30].lower() if len(content) > 15 else None
+                    if fp and fp in seen_fp:
+                        continue
+                    if fp:
+                        seen_fp.add(fp)
+                    final_lines.append(line)
+                deduped_lines = final_lines
+
+        text = '\n'.join(deduped_lines)
         return text.strip()
 
     def _estimate_confidence(self, generated_length: int,

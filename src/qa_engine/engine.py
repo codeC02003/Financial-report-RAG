@@ -70,7 +70,12 @@ class DocumentIndex:
                     has_bonds = bool(re.search(
                         r'notes?\s+due|bonds?\s+due|%\s+notes?\s+due|debt|issuance|–\s*20\d{2}',
                         stripped, re.IGNORECASE))
-                    if len(words) <= 12 and not has_financial and not has_months and not has_bonds:
+                    # Skip lines where years are mixed with dollar values
+                    # e.g. "2025 $163 2026" is a payment schedule, not a year header
+                    has_dollar_between = bool(re.search(r'20\d{2}\s+\$', stripped))
+                    if (len(words) <= 12 and not has_financial
+                            and not has_months and not has_bonds
+                            and not has_dollar_between):
                         for ym in year_matches:
                             y = int(ym)
                             if 2015 <= y <= 2030:
@@ -624,9 +629,14 @@ def _try_table_extraction(question: str, chunks: list,
         # Vague yes/no questions about financials
         "any debt", "any risk", "any issue",
     ]
-    for pat in skip_types:
-        if re.search(pat, q_lower):
-            return None
+    # Don't skip if the question is about trends/changes (these use table data)
+    is_trend_q = bool(re.search(
+        r'trend|growth|change.*over|changed|how did .+ (change|perform)|'
+        r'year.over.year|yoy|increased|decreased', q_lower))
+    if not is_trend_q:
+        for pat in skip_types:
+            if re.search(pat, q_lower):
+                return None
 
     # --- Comparison / Difference questions ---
     diff_match = re.search(
@@ -692,6 +702,58 @@ def _try_table_extraction(question: str, chunks: list,
             q_lower)
         if trend_match3:
             trend_match = trend_match3
+    if not trend_match:
+        # "what are the X trends" / "X trend analysis" / "trends in X"
+        trend_match4 = re.search(
+            r'(?:what (?:are|is) (?:the )?)?(.+?)\s*trends?(?:\s+analysis)?',
+            q_lower)
+        if trend_match4:
+            trend_match = trend_match4
+    if not trend_match:
+        # "trends in X" / "trend of X"
+        trend_match5 = re.search(r'trends?\s+(?:in|of|for)\s+(.+)', q_lower)
+        if trend_match5:
+            trend_match = trend_match5
+
+    # Handle vague/broad trend questions like "growth trends" or "financial trends"
+    is_broad_trend = trend_match and trend_match.group(1).strip().lower() in (
+        "growth", "financial", "key", "main", "overall", "the", "the growth",
+        "the financial", "the key", "the main", "revenue and income",
+    )
+    if is_broad_trend and doc_index and doc_index.fiscal_years:
+        # Show trends for multiple key metrics
+        _trend_labels = ["revenue", "net sales", "net income", "gross margin",
+                         "operating income", "total assets", "cost of sales"]
+        trend_parts = []
+        seen_labels = set()  # Deduplicate labels (e.g., "Net sales" matched twice)
+        for target in _trend_labels:
+            target_terms = _expand_query_with_synonyms([target], doc_index)
+            label = _match_label(target_terms, doc_index)
+            if label and label not in seen_labels:
+                seen_labels.add(label)
+                row = _find_row_values(label, chunks)
+                if row and len(row) >= 2:
+                    years = sorted(doc_index.fiscal_years, reverse=True)[:len(row)]
+                    # Only show values we have confirmed years for
+                    n_years = min(len(row), len(years))
+                    vals = []
+                    for j in range(n_years - 1, -1, -1):
+                        yr = years[j]
+                        val = row[j]
+                        if j < n_years - 1:
+                            older = row[j + 1]
+                            arrow = "↑" if val > older else "↓" if val < older else "→"
+                            vals.append(f"{yr}: ${val:,} ({arrow} ${abs(val - older):,})")
+                        else:
+                            vals.append(f"{yr}: ${val:,}")
+                    if vals:
+                        trend_parts.append(f"**{label}**: {' | '.join(vals)}")
+            if len(trend_parts) >= 5:
+                break
+        if trend_parts:
+            return "Key financial trends:\n" + "\n".join(f"- {p}" for p in trend_parts)
+        return None
+
     if trend_match:
         terms = _extract_terms(trend_match.group(1))
         if terms:
@@ -1164,6 +1226,43 @@ class DocumentQAEngine:
                     who_text = "\n\n".join(who_chunks)
                     conv_context = who_text + "\n\n" + conv_context
 
+            # For topic-specific questions, scan all chunks for section headings
+            # and content that match the topic (risks, legal, segments, etc.)
+            _topic_map = {
+                "risk": ["risk factors", "risks related", "item 1a"],
+                "legal": ["legal proceedings", "item 3", "litigation", "lawsuit"],
+                "segment": ["business segments", "segment information", "reportable segment"],
+                "audit": ["independent auditor", "audit committee", "auditor report"],
+                "governance": ["corporate governance", "board of directors", "item 10"],
+                "compensation": ["executive compensation", "item 11", "compensation"],
+                "property": ["item 2", "properties", "facilities"],
+            }
+            matched_topic = None
+            for topic, keywords in _topic_map.items():
+                if topic in q_lower:
+                    matched_topic = keywords
+                    break
+            if matched_topic:
+                topic_chunks = []
+                for c in self.chunks:
+                    c_lower = c.text.lower()
+                    hits = sum(1 for kw in matched_topic if kw in c_lower)
+                    if hits > 0:
+                        # Bonus for chunks with section headers (Item 1A, Risk Factors, etc.)
+                        has_header = bool(re.search(
+                            r'(?:item\s+\d|risk factors|legal proceedings|'
+                            r'business segments|properties)',
+                            c_lower))
+                        score = hits + (3 if has_header else 0)
+                        topic_chunks.append((score, c))
+                if topic_chunks:
+                    topic_chunks.sort(key=lambda x: x[0], reverse=True)
+                    topic_text = "\n\n".join(
+                        f"[Page {c.page_number}]: {c.text[:600]}"
+                        for _, c in topic_chunks[:8]
+                    )
+                    conv_context = topic_text + "\n\n" + conv_context
+
             # For financial highlights/summary questions, extract key metrics
             # from the document index so the model has real numbers
             is_highlights = bool(re.search(
@@ -1263,11 +1362,16 @@ class DocumentQAEngine:
         ]
         table_answer = _try_table_extraction(table_question, all_chunk_dicts, self._doc_index)
         if table_answer:
-            # Only elaborate complex answers (trends, comparisons, percentages).
-            # Simple value lookups (e.g. "$74,391") don't need elaboration —
-            # the VLM can actually corrupt them by substituting wrong values from context.
+            # Skip VLM elaboration for answers that are already structured and precise.
+            # The VLM can corrupt year labels and values by hallucinating.
             is_simple_value = bool(re.match(r'^\$[\d,]+$', table_answer.strip()))
-            if is_simple_value:
+            # Multi-line trend/comparison answers with arrows or "Key financial" are already complete
+            is_structured = (
+                '↑' in table_answer or '↓' in table_answer or '→' in table_answer
+                or table_answer.startswith('Key financial')
+                or '\n' in table_answer.strip()
+            )
+            if is_simple_value or is_structured:
                 return _result(table_answer, 0.85, method="table")
             elab = self.vision_model.elaborate(question, table_answer, context_text, self._doc_overview)
             elaborated = elab["answer"]
